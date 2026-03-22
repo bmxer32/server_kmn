@@ -19,9 +19,24 @@ class Room {
   Player? player1;
   Player? player2;
   int round = 1;
+  Timer? _inactivityTimer;
   bool get isFull => player1 != null && player2 != null;
   bool get bothChosen => player1?.choice != null && player2?.choice != null;
   Room(this.code);
+
+  void resetTimer() {
+    _inactivityTimer?.cancel();
+    _inactivityTimer = Timer(const Duration(minutes: 1), () {
+      print('[room $code] closed due to inactivity');
+      if (player1 != null) send(player1!.channel, {'type': 'room_closed', 'reason': 'inactivity'});
+      if (player2 != null) send(player2!.channel, {'type': 'room_closed', 'reason': 'inactivity'});
+      rooms.remove(code);
+    });
+  }
+
+  void cancelTimer() {
+    _inactivityTimer?.cancel();
+  }
 }
 
 // ── Game Logic ──────────────────────────────────────────────────────────────
@@ -50,6 +65,7 @@ String generateCode() {
 }
 
 void removeRoom(String code) {
+  rooms[code]?.cancelTimer();
   rooms.remove(code);
   print('[room $code] removed (${rooms.length} active)');
 }
@@ -108,6 +124,7 @@ void _handleCreate(WebSocketChannel ch) {
   room.player1 = Player(ch);
   rooms[code] = room;
 
+  room.resetTimer();
   print('[room $code] created (${rooms.length} active)');
   send(ch, {'type': 'created', 'code': code});
 }
@@ -129,6 +146,7 @@ void _handleJoin(WebSocketChannel ch, String? code) {
   }
 
   room.player2 = Player(ch);
+  room.resetTimer();
   print('[room $code] player2 joined');
 
   send(ch, {'type': 'joined', 'code': code});
@@ -168,6 +186,7 @@ void _handleMove(WebSocketChannel ch, String? choice) {
   }
 
   player.choice = choice;
+  room.resetTimer();
   send(opponent.channel, {'type': 'opponent_ready'});
 
   if (room.bothChosen) {
