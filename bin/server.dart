@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:shelf/shelf.dart' as shelf;
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -236,7 +238,7 @@ void handleDisconnect(WebSocketChannel ch) {
 Future<void> main() async {
   final port = int.fromEnvironment('PORT', defaultValue: 8080);
 
-  final handler = webSocketHandler((WebSocketChannel channel, String? protocol) {
+  final wsHandler = webSocketHandler((WebSocketChannel channel, String? protocol) {
     print('[+] client connected');
 
     channel.stream.listen(
@@ -254,6 +256,24 @@ Future<void> main() async {
         handleDisconnect(channel);
       },
     );
+  });
+
+  // HTTP health-check + WebSocket on same port
+  shelf.Response healthCheck(shelf.Request request) {
+    return shelf.Response.ok(
+      jsonEncode({'status': 'ok', 'rooms': rooms.length}),
+      headers: {'content-type': 'application/json'},
+    );
+  }
+
+  final handler = const shelf.Pipeline()
+      .addHandler((shelf.Request request) {
+    // WebSocket upgrade requests go to wsHandler
+    if (request.headers['upgrade']?.toLowerCase() == 'websocket') {
+      return wsHandler(request);
+    }
+    // Everything else is a health check
+    return healthCheck(request);
   });
 
   final server = await io.serve(handler, InternetAddress.anyIPv4, port);
