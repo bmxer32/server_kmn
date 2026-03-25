@@ -41,6 +41,36 @@ class Room {
   }
 }
 
+// ── Tank Game Models ────────────────────────────────────────────────────────
+
+class TankPlayer {
+  final WebSocketChannel channel;
+  TankPlayer(this.channel);
+}
+
+class TankRoom {
+  final String code;
+  TankPlayer? player1;
+  TankPlayer? player2;
+  Timer? _inactivityTimer;
+  bool get isFull => player1 != null && player2 != null;
+  TankRoom(this.code);
+
+  void resetTimer() {
+    _inactivityTimer?.cancel();
+    _inactivityTimer = Timer(const Duration(minutes: 3), () {
+      print('[tank $code] closed due to inactivity');
+      if (player1 != null) send(player1!.channel, {'type': 'room_closed', 'reason': 'inactivity'});
+      if (player2 != null) send(player2!.channel, {'type': 'room_closed', 'reason': 'inactivity'});
+      tankRooms.remove(code);
+    });
+  }
+
+  void cancelTimer() {
+    _inactivityTimer?.cancel();
+  }
+}
+
 // ── Game Logic ──────────────────────────────────────────────────────────────
 
 String resolveRound(String move1, String move2) {
@@ -56,13 +86,14 @@ String resolveRound(String move1, String move2) {
 // ── Server State ────────────────────────────────────────────────────────────
 
 final Map<String, Room> rooms = {};
+final Map<String, TankRoom> tankRooms = {};
 final _random = Random();
 
 String generateCode() {
   String code;
   do {
     code = (1000 + _random.nextInt(9000)).toString();
-  } while (rooms.containsKey(code));
+  } while (rooms.containsKey(code) || tankRooms.containsKey(code));
   return code;
 }
 
@@ -112,6 +143,17 @@ void handleMessage(WebSocketChannel ch, String raw) {
       _handleMove(ch, msg['choice'] as String?);
     case 'leave':
       _handleLeave(ch);
+    // Tank game messages
+    case 'tank_create':
+      _handleTankCreate(ch);
+    case 'tank_join':
+      _handleTankJoin(ch, msg['code'] as String?);
+    case 'tank_input':
+      _handleTankInput(ch, msg);
+    case 'tank_dead':
+      _handleTankDead(ch);
+    case 'tank_leave':
+      _handleTankLeave(ch);
     default:
       send(ch, {'type': 'error', 'message': 'unknown type: $type'});
   }
@@ -231,6 +273,122 @@ void _handleLeave(WebSocketChannel ch) {
 
 void handleDisconnect(WebSocketChannel ch) {
   _handleLeave(ch);
+  _handleTankLeave(ch);
+}
+
+// ── Tank Game Helpers ───────────────────────────────────────────────────────
+
+TankRoom? findTankRoomByChannel(WebSocketChannel ch) {
+  for (final room in tankRooms.values) {
+    if (room.player1?.channel == ch || room.player2?.channel == ch) {
+      return room;
+    }
+  }
+  return null;
+}
+
+bool isTankPlayer1(TankRoom room, WebSocketChannel ch) =>
+    room.player1?.channel == ch;
+
+void removeTankRoom(String code) {
+  tankRooms[code]?.cancelTimer();
+  tankRooms.remove(code);
+  print('[tank $code] removed (${tankRooms.length} active tank rooms)');
+}
+
+// ── Tank Game Message Handling ──────────────────────────────────────────────
+
+void _handleTankCreate(WebSocketChannel ch) {
+  final existing = findTankRoomByChannel(ch);
+  if (existing != null) _handleTankLeave(ch);
+
+  final code = generateCode();
+  final room = TankRoom(code);
+  room.player1 = TankPlayer(ch);
+  tankRooms[code] = room;
+
+  room.resetTimer();
+  print('[tank $code] created (${tankRooms.length} active tank rooms)');
+  send(ch, {'type': 'created', 'code': code});
+}
+
+void _handleTankJoin(WebSocketChannel ch, String? code) {
+  if (code == null) {
+    send(ch, {'type': 'error', 'message': 'code required'});
+    return;
+  }
+
+  final room = tankRooms[code];
+  if (room == null) {
+    send(ch, {'type': 'error', 'message': 'room_not_found'});
+    return;
+  }
+  if (room.isFull) {
+    send(ch, {'type': 'error', 'message': 'room_full'});
+    return;
+  }
+
+  room.player2 = TankPlayer(ch);
+  room.resetTimer();
+  print('[tank $code] player2 joined');
+
+  send(ch, {'type': 'joined', 'code': code});
+
+  // Notify both: game starts
+  send(room.player1!.channel, {
+    'type': 'tank_start',
+    'role': 'player1',
+  });
+  send(room.player2!.channel, {
+    'type': 'tank_start',
+    'role': 'player2',
+  });
+}
+
+void _handleTankInput(WebSocketChannel ch, Map<String, dynamic> msg) {
+  final room = findTankRoomByChannel(ch);
+  if (room == null || !room.isFull) return;
+
+  room.resetTimer();
+
+  // Relay input to opponent
+  final isP1 = isTankPlayer1(room, ch);
+  final opponent = isP1 ? room.player2! : room.player1!;
+
+  send(opponent.channel, {
+    'type': 'tank_opponent_input',
+    'action': msg['action'],
+    'direction': msg['direction'],
+  });
+}
+
+void _handleTankDead(WebSocketChannel ch) {
+  final room = findTankRoomByChannel(ch);
+  if (room == null || !room.isFull) return;
+
+  final isP1 = isTankPlayer1(room, ch);
+  final opponent = isP1 ? room.player2! : room.player1!;
+
+  // The sender died → opponent wins
+  send(opponent.channel, {'type': 'tank_opponent_dead'});
+  send(ch, {'type': 'tank_you_dead'});
+
+  print('[tank ${room.code}] ${isP1 ? "player1" : "player2"} died');
+}
+
+void _handleTankLeave(WebSocketChannel ch) {
+  final room = findTankRoomByChannel(ch);
+  if (room == null) return;
+
+  final code = room.code;
+  final isP1 = isTankPlayer1(room, ch);
+
+  final opponent = isP1 ? room.player2 : room.player1;
+  if (opponent != null) {
+    send(opponent.channel, {'type': 'opponent_left'});
+  }
+
+  removeTankRoom(code);
 }
 
 // ── Server Entry Point ──────────────────────────────────────────────────────
